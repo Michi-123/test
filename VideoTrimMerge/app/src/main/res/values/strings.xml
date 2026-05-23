@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">動画トリム＆結合</string>
+    <string name="empty_hint">＋ボタンで動画を追加してください\n複数の動画を選択できます</string>
+    <string name="merge_export">結合してエクスポート</string>
+    <string name="add_video">動画を追加</string>
+    <string name="cancel">キャンセル</string>
+    <string name="save_trim">保存</string>
+</resources>
