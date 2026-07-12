@@ -196,6 +196,7 @@
       this.currentTime = 0;
       this.isPlaying = false;
       this.selectedClipId = null;
+      this.cutMode = false;
       this.zoomLevel = 100;
       this.animFrameId = null;
       this.lastFrameTime = 0;
@@ -350,6 +351,50 @@
       this.selectedClipId = clipId;
       this.renderTimeline();
       this.renderProperties();
+    }
+
+    // ---- Cut Tool ----
+    toggleCutMode() {
+      this.cutMode = !this.cutMode;
+      document.getElementById('btn-cut-tool').classList.toggle('active', this.cutMode);
+      document.getElementById('track-lanes').classList.toggle('cut-mode', this.cutMode);
+      this.renderTimeline();
+    }
+
+    // Split a clip into two at the given timeline position (seconds)
+    splitClip(clipId, time) {
+      const MIN_PIECE = 0.1;
+      const clip = this.getClip(clipId);
+      const track = this.getTrackForClip(clipId);
+      if (!clip || !track) return;
+      if (time <= clip.startTime + MIN_PIECE || time >= clip.endTime - MIN_PIECE) return;
+
+      const media = this.getMedia(clip.mediaId);
+      if (!media) return;
+
+      const offset = time - clip.startTime; // duration of the left piece
+
+      const right = new Clip(media, track.type);
+      right.startTime = time;
+      right.originalDuration = clip.originalDuration;
+      right.imageDuration = clip.imageDuration;
+      right.trimStart = clip.trimStart + offset;
+      right.trimEnd = clip.trimEnd;
+      right.volume = clip.volume;
+      right.fadeIn = 0;
+      right.fadeOut = clip.fadeOut;
+
+      // Left piece keeps its head; the tail is trimmed away at the cut point
+      clip.trimEnd = clip.effectiveDuration - clip.trimStart - offset;
+      clip.fadeOut = 0;
+
+      const idx = track.clips.indexOf(clip);
+      track.clips.splice(idx + 1, 0, right);
+
+      this.selectedClipId = right.id;
+      this.renderTimeline();
+      this.renderProperties();
+      this.renderPreview();
     }
 
     // ---- Playback ----
@@ -721,9 +766,17 @@
         <div class="trim-handle trim-handle-right"></div>
       `;
 
-      // Selection
+      // Selection / cut
       el.addEventListener('mousedown', (e) => {
         if (e.target.classList.contains('trim-handle')) return;
+        if (this.cutMode) {
+          const rect = el.getBoundingClientRect();
+          const t = clip.startTime + (e.clientX - rect.left) / this.pixelsPerSecond;
+          this.splitClip(clip.id, t);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
         this.selectClip(clip.id);
       });
 
@@ -753,6 +806,7 @@
       const onMouseDown = (e) => {
         if (e.target.classList.contains('trim-handle')) return;
         if (e.button !== 0) return;
+        if (this.cutMode) return;
         isDragging = true;
         startX = e.clientX;
         origStartTime = clip.startTime;
@@ -1039,203 +1093,203 @@
       });
     }
 
-    // ---- Export ----
-    async exportVideo() {
-      const modal = document.getElementById('export-modal');
-      modal.style.display = 'flex';
+    // ---- Export (ffmpeg command generation) ----
+    exportVideo() {
+      document.getElementById('ffmpeg-output-wrap').style.display = 'none';
+      document.getElementById('btn-copy-command').style.display = 'none';
+      document.getElementById('btn-download-command').style.display = 'none';
+      document.getElementById('export-modal').style.display = 'flex';
     }
 
-    async startExport() {
-      const progressEl = document.getElementById('export-progress');
-      const progressFill = document.getElementById('export-progress-fill');
-      const statusEl = document.getElementById('export-status');
-      const btnStart = document.getElementById('btn-export-start');
-      const btnCancel = document.getElementById('btn-export-cancel');
+    generateExportCommand() {
+      const [w, h] = document.getElementById('export-resolution').value.split('x').map(Number);
+      const fps = parseInt(document.getElementById('export-fps').value);
+      const outName = (document.getElementById('export-filename').value || '').trim() || 'output.mp4';
 
-      progressEl.style.display = 'block';
-      btnStart.disabled = true;
-
-      const resSelect = document.getElementById('export-resolution');
-      const fpsSelect = document.getElementById('export-fps');
-      const [w, h] = resSelect.value.split('x').map(Number);
-      const fps = parseInt(fpsSelect.value);
-
-      // Create offscreen canvas
-      const exportCanvas = document.createElement('canvas');
-      exportCanvas.width = w;
-      exportCanvas.height = h;
-      const exportCtx = exportCanvas.getContext('2d');
-
-      // Create audio destination for mixing
-      this.ensureAudioContext();
-      const dest = this.audioContext.createMediaStreamDestination();
-
-      // Combine canvas stream and audio stream
-      const canvasStream = exportCanvas.captureStream(fps);
-      const combinedStream = new MediaStream();
-
-      // Add video tracks from canvas
-      for (const t of canvasStream.getVideoTracks()) {
-        combinedStream.addTrack(t);
-      }
-      // Add audio tracks from dest
-      for (const t of dest.stream.getAudioTracks()) {
-        combinedStream.addTrack(t);
+      const cmd = this.buildFfmpegCommand(w, h, fps, outName);
+      if (!cmd) {
+        alert('タイムラインにクリップがありません');
+        return;
       }
 
-      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-        ? 'video/webm;codecs=vp9,opus'
-        : 'video/webm';
+      document.getElementById('ffmpeg-command').value = cmd;
+      document.getElementById('ffmpeg-output-wrap').style.display = 'block';
+      document.getElementById('btn-copy-command').style.display = '';
+      document.getElementById('btn-download-command').style.display = '';
+    }
 
-      const recorder = new MediaRecorder(combinedStream, {
-        mimeType,
-        videoBitsPerSecond: 8000000
-      });
-
-      const chunks = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
+    buildFfmpegCommand(w, h, fps, outName) {
+      // Format a number without unnecessary trailing zeros
+      const fmt = (n) => {
+        const s = Number(n).toFixed(3);
+        return s.replace(/\.?0+$/, '') || '0';
       };
+      // POSIX shell single-quote escaping
+      const q = (s) => `'` + String(s).replace(/'/g, `'\\''`) + `'`;
 
-      let cancelled = false;
-      btnCancel.onclick = () => {
-        cancelled = true;
-        recorder.stop();
-      };
-
-      recorder.onstop = () => {
-        if (cancelled) {
-          document.getElementById('export-modal').style.display = 'none';
-          progressEl.style.display = 'none';
-          btnStart.disabled = false;
-          return;
-        }
-
-        const blob = new Blob(chunks, { type: mimeType });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'video_export.webm';
-        a.click();
-        URL.revokeObjectURL(url);
-
-        statusEl.textContent = 'エクスポート完了!';
-        progressFill.style.width = '100%';
-        btnStart.disabled = false;
-        btnStart.textContent = '閉じる';
-        btnStart.onclick = () => {
-          document.getElementById('export-modal').style.display = 'none';
-          progressEl.style.display = 'none';
-          btnStart.disabled = false;
-          btnStart.textContent = 'エクスポート開始';
-          btnStart.onclick = null;
-        };
-      };
-
-      recorder.start(100);
-
-      // Real-time playback export
-      const totalDur = this.totalDuration;
-      const savedTime = this.currentTime;
-      this.currentTime = 0;
-
-      // Setup audio sources connected to destination
-      const audioSources = [];
+      // Actual timeline length (totalDuration has a 10s floor for the UI)
+      let total = 0;
       for (const track of this.tracks) {
-        if (track.muted) continue;
         for (const clip of track.clips) {
-          if (clip.mediaType === 'audio' || clip.mediaType === 'video') {
-            if (clip.element) {
-              try {
-                const source = this.audioContext.createMediaElementSource(clip.element);
-                const gainNode = this.audioContext.createGain();
-                gainNode.gain.value = clip.volume / 100;
-                source.connect(gainNode);
-                gainNode.connect(dest);
-                audioSources.push({ source, gainNode, clip });
-              } catch (e) {
-                // Element may already have a source
-              }
-            }
+          if (clip.endTime > total) total = clip.endTime;
+        }
+      }
+      if (total <= 0) return null;
+
+      const inputs = [];   // input argument strings, index = ffmpeg input number
+      const vchains = [];  // per-clip video filter chains
+      const achains = [];  // per-clip audio filter chains
+      const overlays = []; // { label, start, end } in draw order (bottom first)
+      let hasSilentVideoNote = false;
+
+      const scalePad = `scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
+        `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+
+      const addAudioChain = (inIdx, clip) => {
+        const n = achains.length;
+        const dur = clip.duration;
+        let f = `[${inIdx}:a]atrim=start=${fmt(clip.trimStart)}:end=${fmt(clip.originalDuration - clip.trimEnd)},` +
+          `asetpts=PTS-STARTPTS,volume=${fmt(clip.volume / 100)}`;
+        if (clip.fadeIn > 0) {
+          f += `,afade=t=in:st=0:d=${fmt(clip.fadeIn)}`;
+        }
+        if (clip.fadeOut > 0) {
+          f += `,afade=t=out:st=${fmt(Math.max(0, dur - clip.fadeOut))}:d=${fmt(clip.fadeOut)}`;
+        }
+        f += `,adelay=${Math.round(clip.startTime * 1000)}:all=1[a${n}]`;
+        achains.push(f);
+      };
+
+      // Video tracks: the preview draws the last track first, so the first
+      // track ends up on top. Overlay in the same order (bottom first).
+      const videoTracks = this.tracks.filter(t => t.type === 'video');
+      for (let ti = videoTracks.length - 1; ti >= 0; ti--) {
+        const track = videoTracks[ti];
+        if (!track.visible || track.muted) continue;
+
+        const clips = [...track.clips].sort((a, b) => a.startTime - b.startTime);
+        for (const clip of clips) {
+          const media = this.getMedia(clip.mediaId);
+          if (!media || clip.duration <= 0) continue;
+
+          const inIdx = inputs.length;
+          const n = overlays.length;
+
+          if (clip.mediaType === 'image') {
+            // Turn the still image into a video stream of the clip's length
+            inputs.push(`-loop 1 -framerate ${fps} -t ${fmt(clip.duration)} -i ${q(media.name)}`);
+            vchains.push(`[${inIdx}:v]fps=${fps},${scalePad},setpts=PTS+${fmt(clip.startTime)}/TB[v${n}]`);
+          } else {
+            inputs.push(`-i ${q(media.name)}`);
+            vchains.push(
+              `[${inIdx}:v]trim=start=${fmt(clip.trimStart)}:end=${fmt(clip.originalDuration - clip.trimEnd)},` +
+              `setpts=PTS-STARTPTS,fps=${fps},${scalePad},setpts=PTS+${fmt(clip.startTime)}/TB[v${n}]`
+            );
+            addAudioChain(inIdx, clip);
+            hasSilentVideoNote = true;
           }
+          overlays.push({ label: `v${n}`, start: clip.startTime, end: clip.endTime });
         }
       }
 
-      // Frame-by-frame rendering
-      const frameDuration = 1 / fps;
-      let exportTime = 0;
-
-      const renderExportFrame = () => {
-        if (cancelled || exportTime >= totalDur) {
-          // Stop all audio
-          this.stopAllMedia();
-          if (!cancelled) {
-            recorder.stop();
-          }
-          this.currentTime = savedTime;
-          return;
+      // Audio tracks
+      for (const track of this.tracks.filter(t => t.type === 'audio')) {
+        if (track.muted) continue;
+        const clips = [...track.clips].sort((a, b) => a.startTime - b.startTime);
+        for (const clip of clips) {
+          const media = this.getMedia(clip.mediaId);
+          if (!media || clip.duration <= 0) continue;
+          const inIdx = inputs.length;
+          inputs.push(`-i ${q(media.name)}`);
+          addAudioChain(inIdx, clip);
         }
+      }
 
-        const progress = (exportTime / totalDur) * 100;
-        progressFill.style.width = progress + '%';
-        statusEl.textContent = `エクスポート中... ${formatTime(exportTime)} / ${formatTime(totalDur)}`;
+      if (overlays.length === 0 && achains.length === 0) return null;
 
-        // Render frame
-        exportCtx.fillStyle = '#000';
-        exportCtx.fillRect(0, 0, w, h);
+      // Build filter_complex
+      const filters = [];
+      filters.push(`color=c=black:s=${w}x${h}:r=${fps}:d=${fmt(total)}[base]`);
+      filters.push(...vchains);
 
-        const videoTracks = this.tracks.filter(tr => tr.type === 'video');
-        for (let i = videoTracks.length - 1; i >= 0; i--) {
-          const track = videoTracks[i];
-          if (!track.visible || track.muted) continue;
+      let prev = 'base';
+      overlays.forEach((o, i) => {
+        const out = i === overlays.length - 1 ? 'vout' : `ov${i}`;
+        filters.push(
+          `[${prev}][${o.label}]overlay=eof_action=pass:enable='between(t,${fmt(o.start)},${fmt(o.end)})'[${out}]`
+        );
+        prev = out;
+      });
+      if (overlays.length === 0) {
+        filters.push(`[base]null[vout]`);
+      }
 
-          for (const clip of track.clips) {
-            if (exportTime < clip.startTime || exportTime >= clip.endTime) continue;
-            if (!clip.element) continue;
+      filters.push(...achains);
+      if (achains.length === 0) {
+        filters.push(`anullsrc=channel_layout=stereo:sample_rate=44100:d=${fmt(total)}[aout]`);
+      } else if (achains.length === 1) {
+        filters.push(`[a0]anull[aout]`);
+      } else {
+        const labels = achains.map((_, i) => `[a${i}]`).join('');
+        filters.push(`${labels}amix=inputs=${achains.length}:duration=longest:normalize=0[aout]`);
+      }
 
-            if (clip.mediaType === 'video') {
-              clip.element.currentTime = exportTime - clip.startTime + clip.trimStart;
-              this.drawVideoFit(exportCtx, clip.element, w, h);
-            } else if (clip.mediaType === 'image') {
-              this.drawVideoFit(exportCtx, clip.element, w, h);
-            }
-          }
-        }
+      // Assemble the (multi-line) command
+      const lines = [];
+      lines.push(`# 出力: ${outName} (${w}x${h}, ${fps}fps, 長さ ${fmt(total)}秒)`);
+      lines.push(`# 素材ファイルと同じディレクトリで実行してください。`);
+      if (hasSilentVideoNote) {
+        lines.push(`# 注意: 音声ストリームを持たない動画クリップがある場合は、対応する [N:a] で始まる行を削除してください。`);
+      }
+      lines.push('');
+      lines.push('ffmpeg -y \\');
+      for (const inp of inputs) {
+        lines.push(`  ${inp} \\`);
+      }
+      lines.push('  -filter_complex "');
+      filters.forEach((f, i) => {
+        lines.push(`    ${f}${i < filters.length - 1 ? ';' : ''}`);
+      });
+      lines.push('  " \\');
+      lines.push('  -map "[vout]" -map "[aout]" \\');
+      lines.push(`  -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -r ${fps} \\`);
+      lines.push('  -c:a aac -b:a 192k \\');
+      lines.push(`  -t ${fmt(total)} \\`);
+      lines.push(`  ${q(outName)}`);
 
-        // Handle audio timing
-        for (const track of this.tracks) {
-          if (track.muted) continue;
-          for (const clip of track.clips) {
-            if (clip.mediaType !== 'audio' && clip.mediaType !== 'video') continue;
-            if (!clip.element) continue;
+      return lines.join('\n');
+    }
 
-            if (exportTime >= clip.startTime && exportTime < clip.endTime) {
-              const localTime = exportTime - clip.startTime + clip.trimStart;
-              clip.element.currentTime = localTime;
-              let vol = clip.volume / 100;
-              const clipLocalTime = exportTime - clip.startTime;
-              const dur = clip.duration;
-              if (clip.fadeIn > 0 && clipLocalTime < clip.fadeIn) {
-                vol *= clipLocalTime / clip.fadeIn;
-              }
-              if (clip.fadeOut > 0 && (dur - clipLocalTime) < clip.fadeOut) {
-                vol *= (dur - clipLocalTime) / clip.fadeOut;
-              }
-              clip.element.volume = clamp(vol, 0, 1);
-              if (clip.element.paused) clip.element.play().catch(() => {});
-            } else {
-              if (!clip.element.paused) clip.element.pause();
-            }
-          }
-        }
-
-        exportTime += frameDuration;
-
-        // Use requestAnimationFrame for smooth export
-        requestAnimationFrame(renderExportFrame);
+    copyExportCommand() {
+      const textarea = document.getElementById('ffmpeg-command');
+      const done = () => {
+        const btn = document.getElementById('btn-copy-command');
+        const orig = btn.textContent;
+        btn.textContent = 'コピーしました';
+        setTimeout(() => { btn.textContent = orig; }, 1500);
       };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(textarea.value).then(done).catch(() => {
+          textarea.select();
+          document.execCommand('copy');
+          done();
+        });
+      } else {
+        textarea.select();
+        document.execCommand('copy');
+        done();
+      }
+    }
 
-      requestAnimationFrame(renderExportFrame);
+    downloadExportCommand() {
+      const cmd = document.getElementById('ffmpeg-command').value;
+      const blob = new Blob(['#!/bin/sh\n\n' + cmd + '\n'], { type: 'text/x-shellscript' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'export_ffmpeg.sh';
+      a.click();
+      URL.revokeObjectURL(url);
     }
 
     // ---- Event Listeners ----
@@ -1290,9 +1344,17 @@
 
       // Keyboard shortcuts
       document.addEventListener('keydown', (e) => {
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
 
         switch (e.code) {
+          case 'KeyC':
+            this.toggleCutMode();
+            break;
+          case 'KeyS':
+            if (this.selectedClipId) {
+              this.splitClip(this.selectedClipId, this.currentTime);
+            }
+            break;
           case 'Space':
             e.preventDefault();
             this.togglePlay();
@@ -1398,11 +1460,15 @@
 
       // Export
       document.getElementById('btn-export').addEventListener('click', () => this.exportVideo());
-      document.getElementById('btn-export-start').addEventListener('click', () => this.startExport());
+      document.getElementById('btn-export-start').addEventListener('click', () => this.generateExportCommand());
+      document.getElementById('btn-copy-command').addEventListener('click', () => this.copyExportCommand());
+      document.getElementById('btn-download-command').addEventListener('click', () => this.downloadExportCommand());
       document.getElementById('btn-export-cancel').addEventListener('click', () => {
         document.getElementById('export-modal').style.display = 'none';
-        document.getElementById('export-progress').style.display = 'none';
       });
+
+      // Cut tool
+      document.getElementById('btn-cut-tool').addEventListener('click', () => this.toggleCutMode());
 
       // Window resize
       window.addEventListener('resize', () => {
